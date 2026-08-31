@@ -1,0 +1,13 @@
+{
+  "name": "homin-push-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ретранслятор пуш-сповіщень для месенджера Гомін",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "keys": "node server.js keys"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": { "web-push": "^3.6.7" }
+}
