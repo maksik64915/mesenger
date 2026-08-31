@@ -1565,6 +1565,39 @@ async function kvGet(k, d){
   }catch(e){ return d; }
 }
 
+/* Пошук по всьому листуванню. У памʼяті лежать тільки хвости
+   розмов, тож шукати треба в базі: читаємо записи, розшифровуємо
+   й порівнюємо. */
+const SCAN_MAX=8000;
+async function searchMessages(q, limit){
+  const needle=String(q||'').trim().toLowerCase();
+  if(!active() || needle.length<2) return [];
+  const u=acc.username, out=[];
+  try{
+    const recs=await tx(['messages'],'readonly', t=>new Promise(res=>{
+      const list=[];
+      const cur=t.objectStore('messages').openCursor(accRange(u));
+      cur.onsuccess=()=>{
+        const k=cur.result;
+        if(!k || list.length>=SCAN_MAX){ res(list); return; }
+        if(S.chats[k.value.chatId]) list.push(k.value);
+        k.continue();
+      };
+      cur.onerror=()=>res(list);
+    }));
+    for(const r of recs){
+      if(out.length>=(limit||60)) break;
+      try{
+        const m=JSON.parse(await box().open(acc.key, r.blob));
+        if(m.type==='text' && m.text && m.text.toLowerCase().indexOf(needle)>=0)
+          out.push({chatId:r.chatId, m});
+      }catch(e){}
+    }
+    out.sort((a,b)=>(b.m.ts||0)-(a.m.ts||0));
+  }catch(e){}
+  return out;
+}
+
 /* Те саме, але зашифроване ключем акаунта — для таємниць
    на кшталт приватного ключа шифрування. */
 async function secretSet(k, v){
@@ -1625,7 +1658,8 @@ window.H.db = {
   supported, active, dead:()=>dead,
   loadAccount, importAll, hasAccount, saveState,
   hydrate, isHydrated, evict, clearMessages, clearCalls, dropAccount, rekey,
-  kvGet, kvSet, secretGet, secretSet, stats, persistent, close, account:()=>acc&&acc.username
+  kvGet, kvSet, secretGet, secretSet, searchMessages, stats, persistent, close,
+  account:()=>acc&&acc.username
 };
 })();
 </script>
@@ -2210,9 +2244,16 @@ SCREENS.chats = {
     if(q){
       const people=all.filter(c=>c.name.toLowerCase().includes(q)||(c.username||'').includes(q));
       const hits=[];
+      const seen=new Set();
       all.forEach(c=>c.messages.forEach(m=>{
-        if(m.type==='text' && m.text && m.text.toLowerCase().includes(q)) hits.push({c,m});
+        if(m.type==='text' && m.text && m.text.toLowerCase().includes(q)){ hits.push({c,m}); seen.add(m.id); }
       }));
+      /* те, що вже поза памʼяттю, приносить пошук по базі */
+      if(S.deep && S.deep.q===q) S.deep.list.forEach(h=>{
+        const c=S.chats[h.chatId];
+        if(c && !c.pendingIn && !seen.has(h.m.id)){ hits.push({c, m:h.m}); seen.add(h.m.id); }
+      });
+      hits.sort((a,b)=>(b.m.ts||0)-(a.m.ts||0));
       if(!people.length && !hits.length){
         rows = `<div class="empty"><div class="ico">${ic('search')}</div><h3>Нічого не знайшли</h3>
           <p>Спробуйте інше слово — або знайдіть людину за юзернеймом.</p>
@@ -2255,7 +2296,9 @@ SCREENS.chats = {
       const pos=q.selectionStart;
       refresh();
       const nq=$('#q',current().el); nq.focus(); try{nq.setSelectionRange(pos,pos);}catch(e){}
+      deepSearch(S.search);
     });
+    deepSearch(S.search);
     root.addEventListener('click', e=>{
       const b=e.target.closest('[data-act]'); if(!b) return;
       const a=b.dataset.act;
@@ -2270,6 +2313,30 @@ SCREENS.chats = {
   },
   onShow(){ refresh(); }
 };
+/* Пошук у базі йде окремо від набору тексту: коли він
+   завершиться, список просто перемальовується. */
+let deepTimer=null;
+function deepSearch(raw){
+  clearTimeout(deepTimer);
+  const query=(normUser(raw)||String(raw||'').trim().toLowerCase());
+  if(query.length<2){ S.deep=null; return; }
+  if(S.deep && S.deep.q===query) return;
+  deepTimer=setTimeout(async ()=>{
+    const list=await window.H.db.searchMessages(query, 60);
+    if(!list.length && !S.deep) { S.deep={q:query, list:[]}; return; }
+    S.deep={q:query, list};
+    const cur=current();
+    if(!cur || cur.name!=='chats') return;
+    const active=document.activeElement, focused=active && active.id==='q';
+    const pos=focused?active.selectionStart:0;
+    refresh();
+    if(focused){
+      const nq=$('#q',current().el);
+      if(nq){ nq.focus(); try{ nq.setSelectionRange(pos,pos); }catch(e){} }
+    }
+  }, 320);
+}
+
 function rowHTML(c,q){
   const m=lastMsg(c);
   let name=esc(c.name);
@@ -2542,10 +2609,19 @@ function cloudRows(){
       <span class="chev">${ic('chev')}</span></button>`;
   const st=cl.state();
   const live=cl.on();
-  const sub = live ? 'Увімкнено · @'+esc(S.me?S.me.username:'')+' · чатів у хмарі: '+cl.chats()
-    : st==='error' ? 'Помилка звʼязку — торкніться, щоб перевірити налаштування'
+  const why={'auth-none':'Authentication у проєкті ще не активовано — Build → Authentication → Get started',
+             rules:'Правила Firestore не пропускають — опублікуйте firestore.rules',
+             'auth-off':'У проєкті не ввімкнено вхід за паролем: Authentication → Sign-in method → Email/Password',
+             taken:'Цей юзернейм у хмарі належить іншому акаунту',
+             net:'Немає звʼязку з Firebase',
+             wrong:'Пароль не підійшов до хмарного акаунта',
+             error:'Firebase відповів помилкою — перевірте, чи створено Firestore і чи опубліковано правила'};
+  const sub = live ? (cl.syncing()
+        ? 'Увімкнено · @'+esc(S.me?S.me.username:'')+' · чатів у хмарі: '+cl.chats()
+        : 'Вхід є, але синхронізація не почалася — найчастіше це правила Firestore')
     : st==='init' ? 'Підключаємось…'
-    : 'Налаштовано, але цей акаунт ще не в хмарі';
+    : (why[cl.authError()] || (st==='error' ? 'Помилка звʼязку — торкніться, щоб перевірити налаштування'
+                                            : 'Налаштовано, але цей акаунт ще не в хмарі'));
   return `<button class="srow" data-act="cloud"><span class="ic" style="background:${live?'#2F8F4E':(st==='error'?'#C0392B':'#6C7B77')}">${ic('cloud')}</span>
       <div class="t"><b>Хмара Firebase</b><small>${sub}</small></div>
       <span class="chev">${ic('chev')}</span></button>`
@@ -2579,6 +2655,8 @@ function cloudSheet(){
     </div>
     <div class="pwerr" id="fbErr"></div>
     <button class="btn" id="fbGo">Зберегти й підключити</button>
+    <button class="btn ghost" id="fbCheck" style="margin-top:8px">${ic('shield')} Перевірити проєкт</button>
+    <div id="fbDiag"></div>
     ${cur?`<button class="btn ghost" id="fbOff" style="margin-top:8px">Вимкнути хмару</button>`:''}`, sh=>{
     const ta=$('#fbCfg',sh), err=$('#fbErr',sh);
     $('#fbGo',sh).onclick=async ()=>{
@@ -2600,7 +2678,45 @@ function cloudSheet(){
       cl.clearConfig();
       closeSheet(); toast('Хмару вимкнено'); refresh();
     };
+    const chk=$('#fbCheck',sh), out=$('#fbDiag',sh);
+    chk.onclick=async ()=>{
+      chk.disabled=true; chk.textContent='Перевіряємо…';
+      out.innerHTML='';
+      const d=await cl.diagnose();
+      chk.disabled=false; chk.innerHTML=ic('shield')+' Перевірити ще раз';
+      out.innerHTML=diagHTML(d);
+    };
   });
+}
+
+/* Перевірка каже не «щось не так», а що саме натиснути в консолі. */
+function diagHTML(d){
+  const line=(state, ok, title, bad)=>`<div class="srow">
+    <span class="ic" style="background:${state?'#2F8F4E':'#C0392B'}">${ic(state?'check':'x')}</span>
+    <div class="t"><b>${title}</b><small>${state?ok:bad}</small></div></div>`;
+  const auth={
+    ok:['Вхід за паролем працює', ''],
+    none:['', 'Authentication ще не активовано: Build → Authentication → Get started'],
+    off:['', 'Увімкніть провайдер: Authentication → Sign-in method → Email/Password → Enable → Save'],
+    net:['', 'Немає звʼязку з Firebase'],
+    error:['', 'Firebase відповів помилкою — перевірте apiKey і projectId']
+  }[d.auth] || ['', 'Невідомо'];
+  const db={
+    ok:['База відповідає, правила пропускають', ''],
+    rules:['', 'Правила не пропускають: Firestore → Rules → вставте firebase/firestore.rules → Publish'],
+    none:['', 'Базу ще не створено: Build → Firestore Database → Create database'],
+    net:['', 'Немає звʼязку з Firestore'],
+    error:['', 'Firestore відповів помилкою']
+  }[d.db] || ['', 'Невідомо'];
+  return `<div class="group" style="margin:14px 0 0">
+    ${line(d.sdk, 'Проєкт '+esc(d.project), 'Підключення до Firebase', 'Не вдалося підняти SDK')}
+    ${line(d.auth==='ok', auth[0], 'Акаунти (Authentication)', auth[1])}
+    ${line(d.db==='ok', db[0], 'База (Firestore)', db[1])}
+    ${line(d.vapid || d.relay,
+        d.vapid?'Ключ Web Push на місці — пуш увімкнеться сам':'Адреса ретранслятора на місці',
+        'Пуш із закритим застосунком',
+        'Немає ані vapidKey, ані relay у firebase-config.js — сповіщення приходитимуть лише поки Гомін відкритий')}
+  </div>`;
 }
 
 function cloudLinkSheet(){
@@ -3153,7 +3269,9 @@ function resultHTML(r,u){
   if(r.error==='self') return `<div class="findmsg">${ic('info')}Це ви 🙂 Ваш юзернейм — @${esc(u)}.</div>`;
   if(r.error==='invalid') return `<div class="findmsg bad">${ic('x')}Юзернейм має бути 3–20 символів: латиниця, цифри та _.</div>`;
   if(r.error==='nonet') return `<div class="findmsg bad">${ic('x')}Немає зʼєднання з мережею. Перевірте інтернет і спробуйте ще раз.</div>`;
-  if(r.error==='notfound') return `<div class="findmsg bad">${ic('x')}@${esc(u)} не знайдено. Або такого юзернейма не існує, або людина зараз не в мережі — попросіть її відкрити Гомін.</div>`;
+  if(r.error==='notfound') return `<div class="findmsg bad">${ic('x')}${window.H.cloud.on()
+    ? '@'+esc(u)+' не знайдено — такого юзернейма немає. Перевірте написання.'
+    : '@'+esc(u)+' не знайдено. Або такого юзернейма не існує, або людина зараз не в мережі — попросіть її відкрити Гомін.'}</div>`;
   const c=r.chat;
   const acts = c.friend
     ? `<button class="btn" data-act="write" data-id="${esc(c.id)}">${ic('chat')} Написати</button>`
@@ -5447,7 +5565,7 @@ const unsubMsgs={};                 // cloudId -> unsubscribe
 const profiles=new Map();           // uid -> профіль
 const link=new Map();               // локальний chatId -> {cloudId, uid}
 let deviceId=null;
-let lastError='', fcmToken=null;
+let lastError='', fcmToken=null, authError='';
 let authReady=null, authSeen=null;
 
 /* ---------- налаштування ---------- */
@@ -5528,25 +5646,32 @@ function mapAuthError(e){
   if(c.indexOf('too-many-requests')>=0) return 'too-many';
   if(c.indexOf('network')>=0) return 'net';
   if(c.indexOf('operation-not-allowed')>=0) return 'auth-off';
-  if(c.indexOf('configuration-not-found')>=0) return 'auth-off';
+  if(c.indexOf('configuration-not-found')>=0) return 'auth-none';
+  if(c.indexOf('permission-denied')>=0) return 'rules';
   return 'error';
 }
 const emailOf = u => u+'@homin.app';
 
 /* Firestore, не діставшись сервера, чекає на нього скільки
    завгодно довго. Там, де на відповідь чекає людина, обмежуємо
-   очікування й повертаємось до прямого звʼязку. */
+   очікування й повертаємось до прямого звʼязку.
+
+   А якщо база мовчить раз за разом (її просто не створили в
+   консолі), більше не чекаємо на неї по кілька секунд щоразу —
+   інакше пошук і перевірка юзернейма здаються зламаними. */
+let fsFails=0;
 function within(promise, ms, fallback){
+  const limit = fsFails>=2 ? 1200 : (ms||8000);
   return Promise.race([
-    promise.catch(()=>fallback),
-    new Promise(res=>setTimeout(()=>res(fallback), ms||8000))
+    promise.then(v=>{ fsFails=0; return v; }).catch(()=>fallback),
+    new Promise(res=>setTimeout(()=>{ fsFails++; res(fallback); }, limit))
   ]);
 }
 
 /* ---------- акаунти ---------- */
 async function usernameFree(u){
   if(!await init()) return null;
-  const s=await within(F.getDoc(F.doc(fs,'usernames',u)), 7000, null);
+  const s=await within(F.getDoc(F.doc(fs,'usernames',u)), 5000, null);
   return s ? !s.exists() : null;
 }
 
@@ -5583,26 +5708,30 @@ async function signUp(username, password, profile){
 async function signIn(username, password){
   if(!await init()) return {error:'no-config'};
   try{
+    authError='';
     const cred=await A.signInWithEmailAndPassword(auth, emailOf(username), await secret(username,password));
     user=cred.user;
     const s=await within(F.getDoc(F.doc(fs,'users',user.uid)), 10000, null);
     const prof=(s && s.exists()) ? s.data() : null;
     await restoreKeys(password, prof);
     return {ok:true, profile: prof};
-  }catch(e){ return {error:mapAuthError(e)}; }
+  }catch(e){ const w=mapAuthError(e); authError=w; return {error:w}; }
 }
 
 /* Локальний акаунт, створений до вмикання хмари. */
 async function linkAccount(username, password, profile){
   const r=await signIn(username, password);
   if(r.ok){
+    authError='';
     await setProfile(profile, true);
     return 'ok';
   }
   if(r.error==='wrong'){
     const up=await signUp(username, password, profile);
+    authError = up==='ok' ? '' : up;
     return up;
   }
+  authError=r.error;
   return r.error;
 }
 
@@ -5895,6 +6024,43 @@ async function enableFCM(){
   }catch(e){ return {ok:false, why:'error', err:String(e&&e.message||e)}; }
 }
 
+/* Перевірка проєкту: що вже налаштовано в консолі, а що ні.
+   Обидві проби лише читають — нічого не створюють. */
+async function diagnose(){
+  const cfg=readCfg()||{};
+  const out={config:!!cfg.apiKey, project:cfg.projectId||'', vapid:!!cfg.vapidKey,
+             relay:!!cfg.relay, sdk:false, auth:'?', db:'?'};
+  if(!await init()) return out;
+  out.sdk=true;
+
+  try{
+    await A.signInWithEmailAndPassword(auth,
+      'zz-homin-probe-'+Date.now()+'@homin.app', 'probe-'+Date.now()+'-x');
+    out.auth='ok';
+  }catch(e){
+    const c=String((e&&e.code)||'');
+    out.auth = c.indexOf('configuration-not-found')>=0 ? 'none'
+             : c.indexOf('operation-not-allowed')>=0 ? 'off'
+             : (c.indexOf('invalid-credential')>=0 || c.indexOf('user-not-found')>=0
+                || c.indexOf('wrong-password')>=0) ? 'ok'
+             : c.indexOf('network')>=0 ? 'net' : 'error';
+  }
+
+  try{
+    await Promise.race([
+      F.getDocFromServer(F.doc(fs,'usernames','zz-homin-probe')),
+      new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), 8000))
+    ]);
+    out.db='ok';
+  }catch(e){
+    const c=String((e&&e.code)||(e&&e.message)||'');
+    out.db = c.indexOf('permission-denied')>=0 ? 'rules'
+           : c.indexOf('timeout')>=0 ? 'none'
+           : c.indexOf('unavailable')>=0 ? 'net' : 'error';
+  }
+  return out;
+}
+
 /* ---------- підписки ---------- */
 function start(){
   if(!user || started || !fs) return;
@@ -5927,15 +6093,17 @@ function stop(){
   if(state==='on') state='ready';
 }
 
-function on(){ return !!(user && fs && started); }
+function on(){ return !!(user && fs); }
+function syncing(){ return !!(user && fs && started); }
 
 window.H.cloud = {
-  configured, state:()=>state, error:()=>lastError, on,
+  configured, state:()=>state, error:()=>lastError, on, syncing,
+  authError:()=>authError,
   uid:()=>user&&user.uid, device,
   config:readCfg,
   setConfig(o){ store.set(CFG, o||null); cfg=readCfg(); },
   clearConfig(){ store.del(CFG); cfg=null; },
-  init, signUp, signIn, signOutCloud, linkAccount, changePassword, usernameFree,
+  init, signUp, signIn, signOutCloud, linkAccount, changePassword, usernameFree, diagnose,
   waitAuth(){ return authReady || Promise.resolve(null); },
   start, stop, lookup, profileOf, setProfile, peersOf, touch,
   ensureCloudChat, send, markRead, friendRequest, acceptFriend, declineFriend,

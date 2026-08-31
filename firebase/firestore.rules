@@ -19,10 +19,17 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/chats/$(chatId)).data.members;
     }
 
-    /* Таблиця зайнятих юзернеймів: читає будь-хто, хто увійшов
-       (щоб знайти людину), займає — тільки її власник, і назавжди. */
+    /* Таблиця зайнятих юзернеймів.
+
+       get — вільний: перевірити «чи вільний @ім'я» треба ще до
+       реєстрації, коли акаунта в людини за визначенням немає.
+       Так читається рівно один документ, який ти вже назвав.
+
+       list — лише для тих, хто увійшов: щоб ніхто не викачав
+       список усіх юзернеймів. */
     match /usernames/{name} {
-      allow read: if signedIn();
+      allow get: if true;
+      allow list: if signedIn();
       allow create: if signedIn()
                     && request.resource.data.uid == me()
                     && request.resource.data.keys().hasOnly(['uid']);

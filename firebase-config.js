@@ -25,16 +25,16 @@
    ці ключі.
    ============================================================ */
 window.HOMIN_FIREBASE = {
-  apiKey: "",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: "",
+  apiKey: "AIzaSyCHio7foRRV2Tdery8W_ubU3x_r1B_c-MQ",
+  authDomain: "homin-129d2.firebaseapp.com",
+  projectId: "homin-129d2",
+  storageBucket: "homin-129d2.firebasestorage.app",
+  messagingSenderId: "1078702982938",
+  appId: "1:1078702982938:web:c70a4d9fff027780fbcea3",
 
   /* Cloud Messaging → Web Push certificates.
      Заповнений — і пуш вмикається сам, без жодних дій людини. */
-  vapidKey: "",
+  vapidKey: "BL3ZatUQlIeXxHxNv44ZpD40j1gjiIlw3OnevpsSfBIffr3Tb5oFMaqJccUIbqfr7z3nI_uOti5VAyk3ys8Yw5s",
 
   /* Необовʼязково: адреса власного ретранслятора з теки
      push-relay. Якщо Cloud Functions не розгортали, вкажіть її
