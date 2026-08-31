@@ -1,0 +1,67 @@
+rules_version = '2';
+
+/* ============================================================
+   Гомін — правила доступу до Firestore
+
+   Без них база відкрита всім, тож вставте цей файл у
+   Firebase Console → Firestore Database → Rules → Publish
+   (або: firebase deploy --only firestore:rules).
+
+   Головне правило: листування чату бачать лише двоє його
+   учасників, і кожен пише повідомлення тільки від свого імені.
+   ============================================================ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function membersOf(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId)).data.members;
+    }
+
+    /* Таблиця зайнятих юзернеймів: читає будь-хто, хто увійшов
+       (щоб знайти людину), займає — тільки її власник, і назавжди. */
+    match /usernames/{name} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+                    && request.resource.data.uid == me()
+                    && request.resource.data.keys().hasOnly(['uid']);
+      allow update, delete: if false;
+    }
+
+    /* Профіль: видно всім, хто увійшов (імʼя, аватар, адреса для
+       пушу, список пристроїв для дзвінків). Змінює лише власник. */
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && uid == me();
+      allow delete: if false;
+
+      /* Токени FCM — приватні: їх читає лише власник і серверна
+         функція, яка працює з правами адміністратора. */
+      match /devices/{deviceId} {
+        allow read, write: if signedIn() && uid == me();
+      }
+    }
+
+    /* Чат між двома людьми. Ідентифікатор — обидва uid по порядку. */
+    match /chats/{chatId} {
+      allow read, delete: if signedIn() && me() in resource.data.members;
+      allow create: if signedIn()
+                    && me() in request.resource.data.members
+                    && request.resource.data.members.size() == 2;
+      /* склад учасників змінити не можна */
+      allow update: if signedIn()
+                    && me() in resource.data.members
+                    && request.resource.data.members == resource.data.members;
+
+      match /msgs/{msgId} {
+        allow read: if signedIn() && me() in membersOf(chatId);
+        allow create: if signedIn()
+                      && request.resource.data.from == me()
+                      && me() in membersOf(chatId);
+        /* правити й видаляти можна лише власні повідомлення */
+        allow update, delete: if signedIn() && resource.data.from == me();
+      }
+    }
+  }
+}

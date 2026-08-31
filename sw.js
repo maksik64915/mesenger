@@ -4,7 +4,7 @@
    повідомляє сторінку про нову версію та показує сповіщення —
    зокрема пуші, які приходять, коли застосунок закрито.
    ============================================================ */
-const VERSION = 'homin-v1.5.0';
+const VERSION = 'homin-v1.6.0';
 const SHELL = VERSION + '-shell';
 const RUNTIME = VERSION + '-runtime';
 
@@ -12,6 +12,7 @@ const RUNTIME = VERSION + '-runtime';
 const CORE = [
   './',
   './index.html',
+  './firebase-config.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -21,7 +22,9 @@ const CORE = [
 ];
 
 /* Бажані, але не критичні: шрифти й бібліотека WebRTC.
-   Якщо мережа підведе під час встановлення — не блокуємо. */
+   Якщо мережа підведе під час встановлення — не блокуємо.
+   Firebase SDK сюди не додаємо: він важкий і потрібен не всім,
+   тож осідає в кеші сам, коли хмару таки вмикають. */
 const OPTIONAL = [
   'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js',
   'https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=Unbounded:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap'
@@ -84,13 +87,29 @@ function show(d) {
   });
 }
 
+/* Пуш приходить у двох виглядах: від власного ретранслятора —
+   плоский {title, body, chatId}, від Firebase Cloud Messaging —
+   {notification:{...}, data:{...}}. Зводимо до одного. */
+function normalize(d) {
+  if (!d || typeof d !== 'object') return {};
+  const n = d.notification || {};
+  const x = d.data || {};
+  return {
+    title: d.title || n.title || x.title,
+    body: d.body || n.body || x.body,
+    chatId: d.chatId || x.chatId || null,
+    tag: d.tag || x.tag || n.tag,
+    url: d.url || x.url
+  };
+}
+
 self.addEventListener('push', event => {
   let d = {};
   if (event.data) {
     try { d = event.data.json(); }
     catch (e) { d = { body: event.data.text() }; }
   }
-  event.waitUntil(show(d));
+  event.waitUntil(show(normalize(d)));
 });
 
 self.addEventListener('notificationclick', event => {
@@ -149,6 +168,23 @@ self.addEventListener('fetch', event => {
   }
 
   const sameOrigin = url.origin === self.location.origin;
+
+  /* Дані проєкту Firebase беремо спершу з мережі: інакше
+     виправлений firebase-config.js лишався б у кеші до наступного
+     оновлення версії. */
+  if (sameOrigin && url.pathname.endsWith('/firebase-config.js')) {
+    event.respondWith((async () => {
+      const cache = await caches.open(SHELL);
+      try {
+        const res = await fetch(req, { cache: 'no-cache' });
+        if (res && res.ok) cache.put(req, res.clone());
+        return res;
+      } catch (e) {
+        return (await cache.match(req)) || Response.error();
+      }
+    })());
+    return;
+  }
 
   event.respondWith((async () => {
     const cacheName = sameOrigin ? SHELL : RUNTIME;
