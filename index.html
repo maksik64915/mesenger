@@ -1236,7 +1236,7 @@ const chatRange = (u,id) => IDBKeyRange.bound([u,id],[u,id,HI]);
 /* ---------- що саме зберігаємо ---------- */
 const CHAT_FIELDS=['id','username','name','bio','avatar','unread','created','lastSeen',
                    'pinned','muted','friend','pendingIn','pendingOut','push',
-                   'uid','cloudId','cloudTs'];
+                   'uid','cloudId','cloudTs','pub'];
 function chatMeta(c){
   const o={}; CHAT_FIELDS.forEach(k=>{ if(c[k]!==undefined) o[k]=c[k]; });
   return o;
@@ -1565,6 +1565,26 @@ async function kvGet(k, d){
   }catch(e){ return d; }
 }
 
+/* Те саме, але зашифроване ключем акаунта — для таємниць
+   на кшталт приватного ключа шифрування. */
+async function secretSet(k, v){
+  if(!active()) return false;
+  try{
+    const blob=await box().seal(acc.key, JSON.stringify(v));
+    await tx(['kv'],'readwrite', t=>t.objectStore('kv').put({acc:acc.username, k, blob, v:null}));
+    return true;
+  }catch(e){ return false; }
+}
+async function secretGet(k, d){
+  if(!active()) return d;
+  try{
+    const r=await tx(['kv'],'readonly', t=>reqP(t.objectStore('kv').get([acc.username,k])));
+    if(!r || !r.blob) return d;
+    const text=await box().open(acc.key, r.blob);
+    return text ? JSON.parse(text) : d;
+  }catch(e){ return d; }
+}
+
 /* ---------- скільки місця займають дані ---------- */
 async function stats(){
   const out={ok:false, chats:0, messages:0, media:0, calls:0, usage:0, quota:0, persisted:false};
@@ -1605,7 +1625,7 @@ window.H.db = {
   supported, active, dead:()=>dead,
   loadAccount, importAll, hasAccount, saveState,
   hydrate, isHydrated, evict, clearMessages, clearCalls, dropAccount, rekey,
-  kvGet, kvSet, stats, persistent, close, account:()=>acc&&acc.username
+  kvGet, kvSet, secretGet, secretSet, stats, persistent, close, account:()=>acc&&acc.username
 };
 })();
 </script>
@@ -1791,6 +1811,7 @@ const auth = {
            email:o.email||'', bio:o.bio||'В мережі через Гомін', avatar:o.avatar||null };
     S.chats={}; S.calls=[];
     if(cloud==='ok') S.me.uid=window.H.cloud.uid();
+    else await window.H.e2e.create(o.password);
     await startSession(o.username, bits, o.remember!==false);
     await initDb();
     await persist();
@@ -1802,6 +1823,8 @@ const auth = {
   /* ---- акаунт із хмари на новому пристрої ---- */
   async adoptCloud(username, password, profile, remember){
     const salt=b64(randomBytes(16));
+    /* ключі вже відкрито під час входу в хмару — лишається
+       покласти їх у нову локальну базу */
     const bits=await deriveBits(password, salt);
     upsertAcc({username, name:profile.name||username, avatar:profile.avatar||null,
                salt, verifier:await verifierOf(bits), created:Date.now()});
@@ -1810,6 +1833,7 @@ const auth = {
     S.chats={}; S.calls=[];
     await startSession(username, bits, remember!==false);
     await initDb();
+    if(window.H.e2e.ready()) await window.H.e2e.rewrap(password);
     await persist();
     window.H.cloud.start();
     return 'ok';
@@ -1829,10 +1853,16 @@ const auth = {
     if(!data.me) data.me={ id:'homin-'+username, username, name:rec.name||username, email:'', bio:'', avatar:rec.avatar||null };
     applyData(data);
     await startSession(username, bits, !!remember);
+    /* Хмара підхоплюється сама: якщо акаунта там ще немає —
+       він створюється тим самим паролем. Нічого вводити не треба. */
     if(window.H.cloud.configured()){
-      const r=await window.H.cloud.signIn(username, password);
-      if(r.ok){ S.me.uid=window.H.cloud.uid(); window.H.cloud.start(); persist(); }
+      const r=await window.H.cloud.linkAccount(username, password,
+        {name:S.me.name, bio:S.me.bio, avatar:S.me.avatar});
+      if(r==='ok'){ S.me.uid=window.H.cloud.uid(); window.H.cloud.start(); }
+    } else {
+      await window.H.e2e.unlock(password, null);
     }
+    persist();
     return 'ok';
   },
 
@@ -1849,6 +1879,7 @@ const auth = {
       const data=await loadData(u, key);
       if(!data || !data.me){ sess=null; return false; }
       applyData(data);
+      await window.H.e2e.resume();
       if(window.H.cloud.configured()){
         window.H.cloud.init().then(async ok=>{
           if(!ok) return;
@@ -1861,6 +1892,7 @@ const auth = {
   },
 
   logout(){
+    window.H.e2e.lock();
     window.H.cloud.signOutCloud();
     window.H.db.close();
     const u=sess?sess.username:store.get(SESSION,null);
@@ -1882,6 +1914,7 @@ const auth = {
        вже не відкриються */
     if(window.H.db.active() && !await window.H.db.rekey(newKey)) return 'failed';
     if(window.H.cloud.on()) await window.H.cloud.changePassword(sess.username, newPass);
+    else await window.H.e2e.rewrap(newPass);
     rec.salt=salt; rec.verifier=await verifierOf(bits);
     upsertAcc(rec);
     sess.bits=bits; sess.key=newKey;
@@ -2459,7 +2492,7 @@ SCREENS.settings = {
         <button class="srow" data-act="wipe"><span class="ic" style="background:#C0392B">${ic('trash')}</span>
           <div class="t"><b style="color:var(--danger)">Видалити акаунт із пристрою</b><small>Профіль, чати та журнал дзвінків</small></div></button>
       </div>
-      <div style="text-align:center;color:var(--faint);font-size:12px;padding:0 0 20px">Гомін · версія 1.5 · PWA</div>
+      <div style="text-align:center;color:var(--faint);font-size:12px;padding:0 0 20px">Гомін · версія 1.7 · PWA</div>
     </div>`;
   },
   mount(root){
@@ -2516,8 +2549,12 @@ function cloudRows(){
   return `<button class="srow" data-act="cloud"><span class="ic" style="background:${live?'#2F8F4E':(st==='error'?'#C0392B':'#6C7B77')}">${ic('cloud')}</span>
       <div class="t"><b>Хмара Firebase</b><small>${sub}</small></div>
       <span class="chev">${ic('chev')}</span></button>`
-    + (live ? '' : `<button class="srow" data-act="cloudlink"><span class="ic" style="background:#0E9C8C">${ic('switchUser')}</span>
-      <div class="t"><b>Підключити цей акаунт до хмари</b><small>Знадобиться пароль від акаунта</small></div>
+    + (live ? `<div class="srow"><span class="ic" style="background:#2F8F4E">${ic('lock')}</span>
+      <div class="t"><b>Наскрізне шифрування</b><small>${window.H.e2e.ready()
+        ? 'Ключі створено — листування в хмарі читають лише співрозмовники'
+        : 'Цей браузер не має WebCrypto, тож шифрування недоступне'}</small></div></div>`
+      : `<button class="srow" data-act="cloudlink"><span class="ic" style="background:#0E9C8C">${ic('switchUser')}</span>
+      <div class="t"><b>Спробувати ще раз</b><small>Зазвичай акаунт підключається сам під час входу — тут можна повторити вручну</small></div>
       <span class="chev">${ic('chev')}</span></button>`);
 }
 
@@ -2532,8 +2569,8 @@ function cloudSheet(){
         <div class="t"><b>Що зробити в Firebase Console</b><small>1. Створити проєкт · 2. Authentication → Sign-in method → Email/Password · 3. Firestore Database → Create · 4. Project settings → Your apps → Web → скопіювати firebaseConfig</small></div></div>
       <div class="srow"><span class="ic" style="background:#C25E36">${ic('shield')}</span>
         <div class="t"><b>Правила доступу</b><small>Вміст файла firebase/firestore.rules вставте у Firestore → Rules, інакше базу зможе прочитати будь-хто</small></div></div>
-      <div class="srow"><span class="ic" style="background:#B8892B">${ic('eye')}</span>
-        <div class="t"><b>Що видно власнику проєкту</b><small>Профілі, списки чатів і текст повідомлень — як у будь-якому месенджері із сервером. Дзвінки й далі йдуть напряму</small></div></div>
+      <div class="srow"><span class="ic" style="background:#2F8F4E">${ic('lock')}</span>
+        <div class="t"><b>Листування зашифроване</b><small>Повідомлення шифруються ключем, який є лише у двох співрозмовників. Власник проєкту бачить час, тип і хто кому написав — але не зміст. Дзвінки й далі йдуть напряму</small></div></div>
     </div>
     <div class="field"><span class="lab">firebaseConfig (JSON)</span>
       <textarea class="keybox" id="fbCfg" spellcheck="false" autocapitalize="off"
@@ -2651,33 +2688,44 @@ function notifBlockedSheet(){
 /* ---------- пуш ---------- */
 function hostOf(url){ try{ return new URL(url).host; }catch(e){ return url; } }
 function pushRow(){
-  const n=window.H.notify;
+  const n=window.H.notify, cl=window.H.cloud;
   if(!n.pushSupported()) return '';
-  const relay=n.relay(), sub=n.subscription();
-  const ready=!!(relay && sub);
+  const fcm=cl.fcm(), relay=!!(n.relay() && n.subscription());
+  const ready=fcm||relay;
+  const sub = fcm ? 'Увімкнено через Firebase — надходять навіть із закритим застосунком'
+    : relay ? 'Увімкнено через ретранслятор '+esc(hostOf(n.relay()))
+    : 'Поки що приходять, лише коли Гомін запущено';
   return `<button class="srow" data-act="push"><span class="ic" style="background:${ready?'#2F8F4E':'#6C7B77'}">${ic('cloud')}</span>
-    <div class="t"><b>Пуш коли застосунок закритий</b><small>${ready
-      ? 'Підключено до '+esc(hostOf(relay))
-      : 'Не налаштовано — зараз сповіщення приходять, лише поки Гомін запущено'}</small></div>
+    <div class="t"><b>Пуш коли застосунок закритий</b><small>${sub}</small></div>
     <span class="chev">${ic('chev')}</span></button>`;
 }
 function pushSheet(){
-  const n=window.H.notify;
-  const relay=n.relay(), ready=!!(relay && n.subscription());
+  const n=window.H.notify, cl=window.H.cloud;
+  const relay=n.relay(), subscribed=!!(relay && n.subscription()), fcm=cl.fcm();
+  const ready=subscribed||fcm;
+  const auto=(cl.config()||{}).relay || ((cl.config()||{}).vapidKey && cl.on());
   openSheet(`<h2>Пуш-сповіщення</h2>
-    <p class="hint">Поки Гомін відкритий, сповіщення приходять самі. Коли застосунок закрито, розбудити пристрій може лише push-служба браузера — а їй потрібен маленький ретранслятор із ключами VAPID. Готовий сервер лежить у теці <span class="mono">push-relay</span>.</p>
+    <div class="group" style="margin:0 0 14px">
+      <div class="srow"><span class="ic" style="background:${ready?'#2F8F4E':'#6C7B77'}">${ic(ready?'check':'bellOff')}</span>
+        <div class="t"><b>${ready?'Усе налаштовано':'Поки що лише поки застосунок відкритий'}</b>
+        <small>${fcm?'Пристрій зареєстровано у Firebase Cloud Messaging'
+                : subscribed?'Підписку оформлено через '+esc(hostOf(relay))
+                : auto?'Спробуємо ввімкнути автоматично, щойно дозволите сповіщення'
+                : 'Той, хто розгортав Гомін, не залишив ані ключа Firebase, ані адреси ретранслятора'}</small></div></div>
+    </div>
+    ${ready?`<button class="btn ghost" id="pOff">Вимкнути пуш</button>`:''}
+    ${fcmBlock()}
+    ${ready?'':`<div class="orline" style="margin:16px 0 10px">вручну</div>
     <div class="field"><span class="lab">Адреса ретранслятора</span>
       <input id="prl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
              placeholder="https://push.example.net" value="${esc(relay)}"></div>
-    <button class="btn" id="pGo">${ready?'Перепідключити':'Підключити'}</button>
-    ${ready?`<button class="btn ghost" id="pOff" style="margin-top:8px">Вимкнути пуш</button>`:''}
-    ${fcmBlock()}
-    <p class="hint" style="margin-top:12px">Ретранслятор дізнається тільки те, що вам щось надійшло, і від кого. Текст, фото, голосові та дзвінки йдуть напряму між пристроями й через нього не проходять.</p>`, sh=>{
+    <button class="btn" id="pGo">Підключити</button>`}
+    <p class="hint" style="margin-top:12px">Хто б не доставляв сповіщення, він дізнається лише те, що вам щось надійшло і від кого. Текст, фото, голосові та дзвінки через нього не проходять — а листування в хмарі ще й зашифроване так, що прочитати його може тільки співрозмовник.</p>`, sh=>{
     const inp=$('#prl',sh), go=$('#pGo',sh);
-    go.onclick=async ()=>{
+    if(go) go.onclick=async ()=>{
       go.disabled=true; go.textContent='Підключаємо…';
       const r=await n.connectRelay(inp.value);
-      go.disabled=false; go.textContent=ready?'Перепідключити':'Підключити';
+      go.disabled=false; go.textContent='Підключити';
       if(r.ok){ closeSheet(); toast('Пуш увімкнено'); buzz(12); refresh(); return; }
       const why={'bad-url':'Потрібна адреса https:// (або http://localhost)',
                  'no-server':'Ретранслятор не відповідає за цією адресою',
@@ -2834,7 +2882,8 @@ function aboutSheet(){
   openSheet(`<h2>Про Гомін</h2>
     <p class="hint">Повідомлення та дзвінки йдуть напряму між браузерами через WebRTC. Сервер потрібен лише щоб пристрої знайшли одне одного за ID — сам вміст листування через нього не проходить.</p>
     <div class="group" style="margin:0 0 12px">
-      <div class="srow"><span class="ic" style="background:#2F8F4E">${ic('shield')}</span><div class="t"><b>Що зберігається</b><small>Чати й профіль лежать лише на цьому пристрої та зашифровані вашим паролем (AES-GCM, ключ похідний від пароля). Емейл не перевіряється й нікуди не надсилається.</small></div></div>
+      <div class="srow"><span class="ic" style="background:#2F8F4E">${ic('shield')}</span><div class="t"><b>Що зберігається</b><small>Чати й профіль лежать у базі на цьому пристрої та зашифровані вашим паролем (AES-GCM, ключ похідний від пароля). Емейл не перевіряється й нікуди не надсилається.</small></div></div>
+      <div class="srow"><span class="ic" style="background:#0E9C8C">${ic('lock')}</span><div class="t"><b>Наскрізне шифрування</b><small>Те, що йде через хмару, шифрується ключем розмови: він народжується з вашого приватного ключа й публічного ключа співрозмовника і нікуди не передається. Приватний ключ зберігається загорнутим у ваш пароль, тож на новому пристрої досить його ввести.</small></div></div>
       <div class="srow"><span class="ic" style="background:#8A6E2B">${ic('key')}</span><div class="t"><b>Вхід без сервера</b><small>Пароль ніде не зберігається, тож відновити його неможливо. Щоб зайти з іншого пристрою, збережіть ключ акаунта.</small></div></div>
       <div class="srow"><span class="ic" style="background:#3C7FA8">${ic('down')}</span><div class="t"><b>Працює офлайн</b><small>Застосунок зберігається на пристрої й відкривається без мережі. Мережа потрібна лише для звʼязку зі співрозмовником.</small></div></div>
       <div class="srow"><span class="ic" style="background:#B8892B">${ic('user')}</span><div class="t"><b>Унікальність юзернейма</b><small>Юзернейм — це ваша адреса в мережі Гомін. Поки він за вами, ніхто інший не може його зайняти.</small></div></div>
@@ -2951,6 +3000,7 @@ SCREENS.contact = {
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:0 14px">
         ${media.map(m=>`<img src="${esc(m.src)}" data-act="view" data-mid="${esc(m.id)}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;cursor:zoom-in">`).join('')}
         </div>`:''}
+      ${encRow(c)}
       <div class="gh">Чат</div>
       <div class="group" style="margin-bottom:24px">
         <button class="srow" data-act="pin"><span class="ic" style="background:#B8892B">${ic('pin')}</span>
@@ -3007,6 +3057,22 @@ SCREENS.contact = {
     });
   }
 };
+
+/* Наскрізне шифрування має бути видно — інакше в нього не
+   вірять і не мають підстав вірити. */
+function encRow(c){
+  const e=window.H.e2e;
+  if(!window.H.cloud.configured()) return '';
+  const on = e.ready() && !!c.pub;
+  return `<div class="gh">Безпека</div>
+    <div class="group">
+      <div class="srow"><span class="ic" style="background:${on?'#2F8F4E':'#B8892B'}">${ic(on?'lock':'info')}</span>
+        <div class="t"><b>${on?'Наскрізне шифрування':'Шифрування ще не узгоджено'}</b>
+        <small>${on
+          ? 'Повідомлення в хмарі зашифровані ключем, який є лише у вас двох. Ані сервер, ані власник проєкту Firebase прочитати їх не можуть.'
+          : 'Ключ співрозмовника ще не отримано — щойно він зайде в мережу, листування почне шифруватися.'}</small></div></div>
+    </div>`;
+}
 
 /* ============================================================
    NEW CHAT
@@ -3849,7 +3915,8 @@ window.H.pickImage=function(camera, cb){
 };
 window.H.pickAvatar=function(cb){
   const inp=$('#pickAvatar'); inp.value='';
-  inp.onchange=()=>{ const f=inp.files&&inp.files[0]; if(!f) return; compress(f,320,.82,true).then(cb).catch(()=>toast('Не вдалося прочитати файл')); };
+  /* аватар подорожує з кожним профілем — тримаємо його легким */
+  inp.onchange=()=>{ const f=inp.files&&inp.files[0]; if(!f) return; compress(f,256,.72,true).then(cb).catch(()=>toast('Не вдалося прочитати файл')); };
   inp.click();
 };
 function compress(file, max, q, square){
@@ -4142,6 +4209,8 @@ function applyProfile(c, prof){
   if(prof.username) c.username=prof.username;
   if(prof.bio) c.bio=prof.bio;
   if(prof.avatar!==undefined) c.avatar=prof.avatar;
+  if(prof.pub && c.uid){ window.H.e2e.forget(c.uid, prof.pub); c.pub=prof.pub; }
+  else if(prof.pub) c.pub=prof.pub;
 }
 function pushMsg(chat, m, silent){
   chat.messages.push(m);
@@ -4258,6 +4327,7 @@ function flush(id){
 const conns={};
 const lookups={};
 let peer=null, peerLoaded=false, callObj=null, idRetry=0, myPeer=null;
+let tries=0, connectAt=0;
 
 /* homin-maks-3f8a1c  ->  homin-maks */
 function canon(pid){
@@ -4307,6 +4377,7 @@ const net = {
     if(!S.me) return;
     if(peer && !peer.destroyed && !peer.disconnected){ if(manual) toast('Уже підключено'); return; }
     setNet('wait');
+    connectAt=Date.now();
     const ok=await loadPeerJS();
     if(!ok || !window.Peer){ setNet('bad'); if(manual) toast('Не вдалося підключитися — перевірте інтернет'); return; }
     try{
@@ -4315,7 +4386,17 @@ const net = {
       myPeer = myPeerId();
       peer = new window.Peer(myPeer, {debug:0});
     }catch(e){ setNet('bad'); return; }
-    peer.on('open', ()=>{ setNet('ok'); idRetry=0;
+    /* Буває, що сервер не відповідає ні «готово», ні помилкою.
+       Без цього сторожа застосунок підключався б нескінченно. */
+    const mine=peer;
+    setTimeout(()=>{
+      if(peer!==mine || !peer || peer.open) return;
+      try{ peer.destroy(); }catch(e){}
+      peer=null;
+      if(tries<3){ tries++; setTimeout(()=>net.start(), 900*tries); }
+      else { tries=0; setNet('bad'); }
+    }, 12000);
+    peer.on('open', ()=>{ setNet('ok'); idRetry=0; tries=0;
       window.H.cloud.touch(myPeer);
       // reconnect to known peers
       if(S.cfg.autoConnect) Object.keys(S.chats).forEach(id=>net.addPeer(id,true));
@@ -4348,13 +4429,21 @@ const net = {
     }
     if(conns[id] && conns[id].open) return;
     try{
-      const conn=peer.connect(targetOf(id),{reliable:true, metadata:{profile:myProfile()}});
+      const conn=peer.connect(targetOf(id),{reliable:true, metadata:{profile:shortProfile()}});
       attach(conn);
     }catch(e){}
   },
   peerId(){ return myPeer; },
   ensureChat,
   receive,
+  /* Телефон, який пролежав у кишені, часто повертається з мертвим
+     сокетом, про який PeerJS ще не знає. Тут ми це помічаємо. */
+  wake(){
+    if(!S.me) return;
+    if(!peer || peer.destroyed || peer.disconnected){ net.start(); return; }
+    if(peer.open){ window.H.cloud.touch(myPeer); return; }
+    if(Date.now()-connectAt > 15000) net.restart();
+  },
   sendTyping(id){
     const conn=conns[id]; const now=Date.now();
     if(!conn||!conn.open) return;
@@ -4420,6 +4509,7 @@ const net = {
         c.bio=prof.bio||'';
         if(prof.avatar!==undefined) c.avatar=prof.avatar||null;
         if(prof.push!==undefined) c.push=prof.push||null;
+        if(prof.pub) c.pub=prof.pub;
         if(prof.seen) c.lastSeen=Math.max(c.lastSeen||0, prof.seen);
         save();
         net.addPeer(id, true);
@@ -4439,7 +4529,7 @@ const net = {
                    fin(known?{ok:true, chat:known, stale:true}:{error:'notfound'}); },
         found:c=>fin({ok:true, chat:c})
       };
-      try{ attach(peer.connect(id,{reliable:true, metadata:{profile:myProfile()}})); }
+      try{ attach(peer.connect(id,{reliable:true, metadata:{profile:shortProfile()}})); }
       catch(e){ return fin({error:'notfound'}); }
       tm=setTimeout(()=>lookups[id] && lookups[id].fail(), 9000);
     });
@@ -4490,7 +4580,15 @@ const net = {
 };
 window.H.net=net;
 
-function myProfile(){ return {name:S.me.name, username:S.me.username, bio:S.me.bio, avatar:S.me.avatar, id:S.me.id}; }
+function myProfile(){ return {name:S.me.name, username:S.me.username, bio:S.me.bio,
+                             avatar:S.me.avatar, id:S.me.id, pub:window.H.e2e.pub()||undefined}; }
+
+/* У метадані зʼєднання кладемо лише імʼя: вони йдуть через
+   сигнальний сервер, а аватар — це кілька десятків кілобайтів
+   у кожному запиті. Саме через це зʼєднання зривалося одразу
+   після зміни фото, і застосунок нескінченно «підключався».
+   Повний профіль приходить у hello вже по каналу даних. */
+function shortProfile(){ return {name:S.me.name, username:S.me.username, id:S.me.id}; }
 
 /* Куди стукати, щоб розбудити цей пристрій. Віддаємо лише друзям —
    і лише тим, кого самі вважаємо друзями. */
@@ -4700,7 +4798,7 @@ async function startCall(id, kind){
   const conn=conns[id];
   if(conn && conn.open){ try{ conn.send({t:'ring', kind}); }catch(e){} }
   else window.H.notify.wake(chat, 'call');   /* друг офлайн — хай телефон задзвонить */
-  try{ callObj = peer.call(targetOf(id), localStream, {metadata:{kind, profile:myProfile()}}); }
+  try{ callObj = peer.call(targetOf(id), localStream, {metadata:{kind, profile:shortProfile()}}); }
   catch(e){ endCall('Не вдалося зателефонувати', true); return; }
   wireCall(callObj);
   setTimeout(()=>{ if(callUI && !callUI.connected) endCall('Немає відповіді', true); }, 45000);
@@ -4820,6 +4918,7 @@ window.H.seedDemo = function(){ return {}; };
 const {S, save, toast} = window.H;
 
 let subCache=null;       // {endpoint, keys:{p256dh, auth}}
+let autoRunning=false;
 let relayCache='';       // адреса ретранслятора цього пристрою
 const woke={};           // коли востаннє будили друга — не частіше разу на хвилину
 
@@ -4938,23 +5037,57 @@ const notify = {
     }catch(e){}
   },
 
-  /* Після входу: підняти підписку й, якщо дозволу ще не питали — запропонувати. */
+  /* Після входу все налаштовується саме: підписка на пуш,
+     реєстрація пристрою у Firebase — жодних адрес і ключів
+     вводити не треба. Питаємо лише дозвіл на сповіщення, бо
+     його дає людина. */
   async afterLogin(){
     try{ await notify.restore(); }catch(e){}
     notify.badge();
+    if(granted()){ notify.autoPush(); return; }
     if(!supported() || permission()!=='default') return;
     setTimeout(()=>{
       toast('Показувати сповіщення про нові повідомлення?', 9000, {label:'Увімкнути', fn:async ()=>{
         const r=await ask();
-        if(r==='granted'){ S.cfg.notifications=true; save(); toast('Сповіщення увімкнено'); notify.badge(); }
+        if(r==='granted'){
+          S.cfg.notifications=true; save(); notify.badge();
+          const how=await notify.autoPush();
+          toast(how ? 'Сповіщення увімкнено — приходитимуть навіть із закритим застосунком'
+                    : 'Сповіщення увімкнено');
+        }
         else if(r==='denied') toast('Браузер заблокував сповіщення для цього сайту');
       }});
     }, 2600);
   },
 
+  /* Пуш сам обирає, чим його доставляти: спершу Firebase, потім
+     ретранслятор, адресу якого залишив той, хто розгортав Гомін. */
+  async autoPush(){
+    if(!granted() || autoRunning) return null;
+    autoRunning=true;
+    try{
+      const cl=window.H.cloud;
+      const cfg=cl.config()||{};
+      if(cl.on() && cfg.vapidKey){
+        const r=await cl.enableFCM();
+        if(r.ok) return 'fcm';
+      }
+      const url=notify.relay();
+      if(url && !subCache){
+        const r=await notify.connectRelay(url);
+        if(r.ok) return 'relay';
+      }
+      return subCache ? 'relay' : null;
+    }catch(e){ return null; }
+    finally{ autoRunning=false; }
+  },
+
   /* ---------- пуш ---------- */
   pushSupported(){ return supported() && 'PushManager' in window; },
-  relay(){ return relayCache || S.cfg.pushRelay || ''; },
+  relay(){
+    const cfg=window.H.cloud.config()||{};
+    return relayCache || S.cfg.pushRelay || cfg.relay || '';
+  },
   subscription(){ return subCache; },
 
   /* Те, що ми віддаємо друзям: куди стукати, щоб нас розбудили. */
@@ -5077,6 +5210,198 @@ window.H.notify = notify;
 </script>
 <script>
 /* ============================================================
+   ГОМІН — наскрізне шифрування
+
+   Хмара зберігає листування, але читати його не може.
+
+   У кожного акаунта є пара ключів ECDH (P-256). Публічний
+   лежить у профілі — його бачать усі. Приватний ніколи не
+   виходить назовні у відкритому вигляді: він загорнутий у
+   AES-GCM ключем, похідним від пароля (PBKDF2, 150 000
+   ітерацій), і в такому вигляді лежить поруч із профілем. Тому
+   на новому пристрої достатньо ввести пароль — і ключ знову
+   ваш; сервер же має лише шматок шифротексту.
+
+   Ключ розмови рахують обидві сторони самостійно: ECDH зі
+   свого приватного й чужого публічного, далі HKDF з іменем
+   чату. Однаковий у двох, невідомий більше нікому — Firebase
+   бачить тільки час, тип і відправника.
+
+   Прямий звʼязок (WebRTC) і без цього шифрований самим
+   браузером, тож там повідомлення йдуть як є.
+   ============================================================ */
+(function(){
+'use strict';
+const {store} = window.H;
+
+const TE=new TextEncoder(), TD=new TextDecoder();
+const subtle = (window.crypto && window.crypto.subtle) ? window.crypto.subtle : null;
+
+let priv=null;          // CryptoKey — лише в памʼяті
+let pubRaw=null;        // мій публічний ключ, base64
+const shared=new Map(); // uid співрозмовника -> CryptoKey розмови
+const theirPub=new Map();
+
+function b64(buf){
+  const a=buf instanceof Uint8Array?buf:new Uint8Array(buf);
+  let s=''; for(let i=0;i<a.length;i+=0x8000) s+=String.fromCharCode.apply(null,a.subarray(i,i+0x8000));
+  return btoa(s);
+}
+function unb64(s){
+  const bin=atob(s), a=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i);
+  return a;
+}
+function rnd(n){ const a=new Uint8Array(n); crypto.getRandomValues(a); return a; }
+
+/* ---------- обгортка приватного ключа паролем ---------- */
+async function wrapKey(password, saltB64){
+  const base=await subtle.importKey('raw', TE.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return subtle.deriveKey(
+    {name:'PBKDF2', salt:unb64(saltB64), iterations:150000, hash:'SHA-256'},
+    base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+async function packPriv(password){
+  const salt=b64(rnd(16));
+  const kek=await wrapKey(password, salt);
+  const pkcs8=await subtle.exportKey('pkcs8', priv);
+  const iv=rnd(12);
+  const ct=await subtle.encrypt({name:'AES-GCM', iv}, kek, pkcs8);
+  return {v:1, salt, iv:b64(iv), ct:b64(ct), pub:pubRaw};
+}
+async function unpackPriv(password, box){
+  const kek=await wrapKey(password, box.salt);
+  const pkcs8=await subtle.decrypt({name:'AES-GCM', iv:unb64(box.iv)}, kek, unb64(box.ct));
+  priv=await subtle.importKey('pkcs8', pkcs8, {name:'ECDH', namedCurve:'P-256'}, true, ['deriveBits']);
+  pubRaw=box.pub;
+}
+
+async function generate(){
+  const pair=await subtle.generateKey({name:'ECDH', namedCurve:'P-256'}, true, ['deriveBits']);
+  priv=pair.privateKey;
+  pubRaw=b64(await subtle.exportKey('raw', pair.publicKey));
+}
+
+/* Локальна копія: обгортка для хмари (щоб було що віддати
+   новому пристрою) і сам ключ — зашифрований ключем акаунта,
+   як і решта бази. Завдяки їй автоматичний вхід не питає пароль. */
+async function saveLocal(box){
+  const db=window.H.db;
+  try{
+    if(box) await db.kvSet('e2e', box);
+    const pkcs8=await subtle.exportKey('pkcs8', priv);
+    await db.secretSet('e2ePriv', {priv:b64(pkcs8), pub:pubRaw});
+  }catch(e){}
+}
+
+/* ---------- ключ конкретної розмови ---------- */
+async function keyFor(uid, pubB64, chatId){
+  if(shared.has(uid)) return shared.get(uid);
+  if(!priv || !pubB64) return null;
+  try{
+    const their=await subtle.importKey('raw', unb64(pubB64), {name:'ECDH', namedCurve:'P-256'}, false, []);
+    const bits=await subtle.deriveBits({name:'ECDH', public:their}, priv, 256);
+    const hk=await subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+    const key=await subtle.deriveKey(
+      {name:'HKDF', hash:'SHA-256', salt:TE.encode(chatId||'homin'), info:TE.encode('homin-msg-v1')},
+      hk, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+    shared.set(uid, key);
+    theirPub.set(uid, pubB64);
+    return key;
+  }catch(e){ return null; }
+}
+/* Співрозмовник змінив ключі — старий спільний ключ уже не той. */
+function forget(uid, pubB64){
+  if(theirPub.get(uid)!==pubB64){ shared.delete(uid); theirPub.delete(uid); }
+}
+
+const e2e = {
+  supported(){ return !!subtle; },
+  ready(){ return !!priv; },
+  pub(){ return pubRaw; },
+
+  /* Реєстрація: нова пара ключів. Повертає те, що можна
+     покласти в хмару. */
+  async create(password){
+    if(!subtle) return null;
+    try{
+      await generate();
+      const box=await packPriv(password);
+      await saveLocal(box);
+      return box;
+    }catch(e){ priv=null; pubRaw=null; return null; }
+  },
+
+  /* Вхід: розгортаємо ключ паролем. box — з хмари або з
+     локальної бази, якщо хмари немає. */
+  async unlock(password, box){
+    if(!subtle) return false;
+    try{
+      const b=box || await window.H.db.kvGet('e2e', null);
+      if(!b || !b.ct) return false;
+      await unpackPriv(password, b);
+      shared.clear(); theirPub.clear();
+      await saveLocal(b);
+      return true;
+    }catch(e){ priv=null; pubRaw=null; return false; }
+  },
+
+  /* Автоматичний вхід: пароля вже немає, зате є локальна копія
+     ключа — вона лежить у базі під ключем акаунта. */
+  async resume(){
+    if(!subtle) return false;
+    try{
+      const local=await window.H.db.secretGet('e2ePriv', null);
+      if(!local || !local.priv) return false;
+      priv=await subtle.importKey('pkcs8', unb64(local.priv), {name:'ECDH', namedCurve:'P-256'}, true, ['deriveBits']);
+      pubRaw=local.pub;
+      shared.clear(); theirPub.clear();
+      return true;
+    }catch(e){ return false; }
+  },
+
+  /* Пароль змінився — переобгортаємо ключ новим. */
+  async rewrap(newPassword){
+    if(!priv) return null;
+    try{
+      const box=await packPriv(newPassword);
+      await saveLocal(box);
+      return box;
+    }catch(e){ return null; }
+  },
+
+  forget,
+  known(uid){ return theirPub.has(uid) || shared.has(uid); },
+
+  /* {e:1, iv, ct} або null, якщо шифрувати нічим */
+  async seal(uid, pubB64, chatId, text){
+    if(text==null || text==='') return null;
+    const key=await keyFor(uid, pubB64, chatId);
+    if(!key) return null;
+    try{
+      const iv=rnd(12);
+      const ct=await subtle.encrypt({name:'AES-GCM', iv}, key, TE.encode(text));
+      return {e:1, iv:b64(iv), ct:b64(ct)};
+    }catch(e){ return null; }
+  },
+  async open(uid, pubB64, chatId, box){
+    if(!box || !box.ct) return null;
+    const key=await keyFor(uid, pubB64, chatId);
+    if(!key) return null;
+    try{
+      const pt=await subtle.decrypt({name:'AES-GCM', iv:unb64(box.iv)}, key, unb64(box.ct));
+      return TD.decode(pt);
+    }catch(e){ return null; }
+  },
+
+  lock(){ priv=null; pubRaw=null; shared.clear(); theirPub.clear(); }
+};
+
+window.H.e2e = e2e;
+})();
+</script>
+<script>
+/* ============================================================
    ГОМІН — хмара (Firebase)
 
    Друга база даних — уже не на пристрої, а на сервері. Вона дає
@@ -5122,7 +5447,7 @@ const unsubMsgs={};                 // cloudId -> unsubscribe
 const profiles=new Map();           // uid -> профіль
 const link=new Map();               // локальний chatId -> {cloudId, uid}
 let deviceId=null;
-let lastError='';
+let lastError='', fcmToken=null;
 let authReady=null, authSeen=null;
 
 /* ---------- налаштування ---------- */
@@ -5232,6 +5557,9 @@ async function signUp(username, password, profile){
     if(free===false) return 'taken';
     const cred=await A.createUserWithEmailAndPassword(auth, emailOf(username), await secret(username,password));
     user=cred.user;
+    /* ключі наскрізного шифрування: приватний іде в хмару лише
+       загорнутий у пароль, тож сервер його не прочитає */
+    const keys=await window.H.e2e.create(password);
     /* помилку транзакції (зокрема «юзернейм зайнято») пропускаємо
        назовні — її розбирає catch нижче */
     const done=await Promise.race([F.runTransaction(fs, async t=>{
@@ -5239,10 +5567,10 @@ async function signUp(username, password, profile){
       const cur=await t.get(ref);
       if(cur.exists() && cur.data().uid!==user.uid) throw new Error('taken');
       t.set(ref, {uid:user.uid});
-      t.set(F.doc(fs,'users',user.uid), {
+      t.set(F.doc(fs,'users',user.uid), Object.assign({
         username, name:profile.name||username, bio:profile.bio||'',
         avatar:profile.avatar||null, seen:Date.now(), peers:{}, push:null
-      });
+      }, keys ? {pub:keys.pub, keys} : {}));
       return 'ok';
     }), new Promise(res=>setTimeout(()=>res('slow'), 12000))]);
     return done==='ok' ? 'ok' : 'net';
@@ -5258,7 +5586,9 @@ async function signIn(username, password){
     const cred=await A.signInWithEmailAndPassword(auth, emailOf(username), await secret(username,password));
     user=cred.user;
     const s=await within(F.getDoc(F.doc(fs,'users',user.uid)), 10000, null);
-    return {ok:true, profile: (s && s.exists()) ? s.data() : null};
+    const prof=(s && s.exists()) ? s.data() : null;
+    await restoreKeys(password, prof);
+    return {ok:true, profile: prof};
   }catch(e){ return {error:mapAuthError(e)}; }
 }
 
@@ -5278,7 +5608,13 @@ async function linkAccount(username, password, profile){
 
 async function changePassword(username, newPass){
   if(!user) return 'no-session';
-  try{ await A.updatePassword(user, await secret(username,newPass)); return 'ok'; }
+  try{
+    await A.updatePassword(user, await secret(username,newPass));
+    /* приватний ключ загорнутий старим паролем — перезагортаємо */
+    const box=await window.H.e2e.rewrap(newPass);
+    if(box) await publishKeys(box);
+    return 'ok';
+  }
   catch(e){ return mapAuthError(e); }
 }
 
@@ -5286,6 +5622,25 @@ async function signOutCloud(){
   stop();
   try{ if(auth) await A.signOut(auth); }catch(e){}
   user=null;
+}
+
+/* Ключі шифрування: беремо з хмари й відмикаємо паролем.
+   Немає — створюємо й публікуємо (старі акаунти). */
+async function restoreKeys(password, prof){
+  const e=window.H.e2e;
+  if(!e.supported()) return false;
+  if(prof && prof.keys && await e.unlock(password, prof.keys)) return true;
+  if(await e.unlock(password, null)) {           /* лишився з минулого разу */
+    if(user) publishKeys(await e.rewrap(password));
+    return true;
+  }
+  const box=await e.create(password);
+  if(box) publishKeys(box);
+  return !!box;
+}
+async function publishKeys(box){
+  if(!user || !box) return;
+  try{ await F.setDoc(F.doc(fs,'users',user.uid), {pub:box.pub, keys:box}, {merge:true}); }catch(e){}
 }
 
 /* ---------- профілі ---------- */
@@ -5380,6 +5735,7 @@ async function applyChatDoc(id, data){
   if(prof.bio!==undefined) c.bio=prof.bio||'';
   if(prof.avatar!==undefined) c.avatar=prof.avatar||null;
   if(prof.push!==undefined) c.push=prof.push||null;
+  if(prof.pub){ window.H.e2e.forget(peerUid, prof.pub); c.pub=prof.pub; }
   if(prof.seen) c.lastSeen=Math.max(c.lastSeen||0, prof.seen);
 
   const wasFriend=c.friend, wasPending=c.pendingIn;
@@ -5424,13 +5780,24 @@ function watchMsgs(cloudId, localId){
   }catch(e){ lastError=String(e&&e.message||e); }
 }
 
-function applyMsg(localId, mid, d){
+async function applyMsg(localId, mid, d){
   if(!d || !d.ts) return;
   const c=S.chats[localId]; if(!c) return;
   const mine = d.from===user.uid;
+  const l=link.get(localId)||{};
+  const e=window.H.e2e;
+  let text=d.text||'', src=d.media||null;
+  if(d.etext){
+    const open=await e.open(l.uid, c.pub, l.cloudId, d.etext);
+    text = open==null ? '🔒 Не вдалося розшифрувати' : open;
+  }
+  if(d.emedia){
+    const open=await e.open(l.uid, c.pub, l.cloudId, d.emedia);
+    if(open) src=open;
+  }
   const m={
-    id:mid, from:mine?'me':'them', type:d.type||'text', text:d.text||'',
-    ts:d.ts, dur:d.dur||0, wave:d.wave||null, src:d.media||null,
+    id:mid, from:mine?'me':'them', type:d.type||'text', text,
+    ts:d.ts, dur:d.dur||0, wave:d.wave||null, src,
     status: mine?'sent':'read', seen: !mine && S.active===localId
   };
   c.cloudTs=Math.max(c.cloudTs||0, d.ts);
@@ -5448,17 +5815,29 @@ async function send(localId, m){
   }
   const cloudId=(link.get(localId)||{}).cloudId;
   if(!cloudId) return false;
-  const doc={from:user.uid, type:m.type||'text', text:m.text||'', ts:m.ts||Date.now(),
+  const doc={from:user.uid, type:m.type||'text', ts:m.ts||Date.now(),
              dur:m.dur||0, wave:m.wave||null};
+  const e=window.H.e2e;
+  const pub=c&&c.pub, peerUid=(link.get(localId)||{}).uid;
+  const etext = await e.seal(peerUid, pub, cloudId, m.text||'');
+  if(etext){ doc.etext=etext; doc.enc=1; }
+  else doc.text=m.text||'';
   if(m.src){
-    if(m.src.length<=MEDIA_MAX) doc.media=m.src;
-    else doc.big=true;      /* завелике для хмари — піде напряму */
+    if(m.src.length>MEDIA_MAX) doc.big=true;   /* завелике для хмари — піде напряму */
+    else {
+      const emedia = doc.enc ? await e.seal(peerUid, pub, cloudId, m.src) : null;
+      if(emedia) doc.emedia=emedia;
+      else if(!doc.enc) doc.media=m.src;
+      else doc.big=true;
+    }
   }
   try{
     await F.setDoc(F.doc(fs,'chats',cloudId,'msgs',m.id), doc);
+    /* у картці чату тексту не тримаємо: він однаково зашифрований,
+       а серверу вистачає часу останнього повідомлення */
     await F.setDoc(F.doc(fs,'chats',cloudId), {
       updated:doc.ts,
-      last:{from:user.uid, type:doc.type, text:doc.text.slice(0,120), ts:doc.ts}
+      last:{from:user.uid, type:doc.type, ts:doc.ts}
     }, {merge:true});
     if(c) c.cloudTs=Math.max(c.cloudTs||0, doc.ts);
     return true;
@@ -5509,6 +5888,7 @@ async function enableFCM(){
     const messaging=m.getMessaging(app);
     const token=await m.getToken(messaging, {vapidKey:cfg.vapidKey, serviceWorkerRegistration:reg});
     if(!token) return {ok:false, why:'denied'};
+    fcmToken=token;
     await F.setDoc(F.doc(fs,'users',user.uid,'devices',device()),
       {fcm:token, seen:Date.now(), ua:navigator.userAgent.slice(0,120)}, {merge:true});
     return {ok:true, token};
@@ -5559,7 +5939,7 @@ window.H.cloud = {
   waitAuth(){ return authReady || Promise.resolve(null); },
   start, stop, lookup, profileOf, setProfile, peersOf, touch,
   ensureCloudChat, send, markRead, friendRequest, acceptFriend, declineFriend,
-  publishPushCard, enableFCM,
+  publishPushCard, enableFCM, fcm:()=>!!fcmToken,
   chats:()=>link.size
 };
 })();
@@ -5620,11 +6000,15 @@ document.addEventListener('keydown', e=>{
 /* keep connections warm */
 document.addEventListener('visibilitychange', ()=>{
   if(document.hidden || !S.me) return;
-  window.H.net.start();
+  window.H.net.wake();
   window.H.notify.clear(S.active||null);
   window.H.notify.badge();
 });
-window.addEventListener('online', ()=>{ if(S.me) window.H.net.start(); });
+window.addEventListener('online', ()=>{ if(S.me) window.H.net.wake(); });
+/* Якщо зʼєднання так і не піднялося, пробуємо ще — тихо, у фоні. */
+setInterval(()=>{
+  if(S.me && document.visibilityState==='visible' && S.net!=='ok') window.H.net.wake();
+}, 30000);
 window.addEventListener('offline', ()=>{ S.net='off'; window.H.refresh&&window.H.refresh(); });
 window.addEventListener('beforeunload', ()=>{ save(); });
 

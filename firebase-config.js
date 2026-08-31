@@ -32,6 +32,13 @@ window.HOMIN_FIREBASE = {
   messagingSenderId: "",
   appId: "",
 
-  /* Cloud Messaging → Web Push certificates */
-  vapidKey: ""
+  /* Cloud Messaging → Web Push certificates.
+     Заповнений — і пуш вмикається сам, без жодних дій людини. */
+  vapidKey: "",
+
+  /* Необовʼязково: адреса власного ретранслятора з теки
+     push-relay. Якщо Cloud Functions не розгортали, вкажіть її
+     тут — застосунок підпишеться на пуш автоматично, і
+     користувачам теж не доведеться нічого вводити. */
+  relay: ""
 };
