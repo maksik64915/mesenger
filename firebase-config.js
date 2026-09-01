@@ -48,23 +48,31 @@ window.HOMIN_FIREBASE = {
 
   /* Сервери для встановлення прямого звʼязку.
 
-     Порожнє — використовуються лише публічні STUN. Їх вистачає
-     в межах однієї мережі, але крізь NAT мобільного оператора
-     прямий звʼязок здебільшого не проходить: там потрібен TURN.
-     Повідомлення в цьому разі однаково доходять через хмару, а
-     от дзвінки — ні.
+     STUN лише підказує вашу зовнішню адресу — цього досить у
+     межах однієї мережі. Крізь NAT мобільного оператора трафік
+     проводить тільки TURN, тож без нього дзвінок між різними
+     мережами не встановиться (повідомлення однаково доходять
+     через хмару).
 
-     Безкоштовних публічних TURN уже не лишилося, тож потрібен
-     свій: metered.ca (50 ГБ на місяць безкоштовно), Cloudflare
-     Calls або власний coturn. Приклад:
+     Тут стоять дані з metered.ca — вони працюють, перевірено.
+     Якщо колись зміните — візьміть новий набір у кабінеті:
+     TURN Server → Credentials → «Show ICE Servers Array». */
+  ice: [
+    { urls: "stun:stun.relay.metered.ca:80" },
+    { urls: "turn:global.relay.metered.ca:80",
+      username: "430ab4afb6c65a841ccee3d2", credential: "7oGuTLrBk1EuhlW9" },
+    { urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: "430ab4afb6c65a841ccee3d2", credential: "7oGuTLrBk1EuhlW9" },
+    { urls: "turn:global.relay.metered.ca:443",
+      username: "430ab4afb6c65a841ccee3d2", credential: "7oGuTLrBk1EuhlW9" },
+    { urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: "430ab4afb6c65a841ccee3d2", credential: "7oGuTLrBk1EuhlW9" }
+  ],
 
-       ice: [
-         { urls: ["stun:stun.l.google.com:19302"] },
-         { urls: ["turn:your.turn.host:3478", "turns:your.turn.host:5349"],
-           username: "homin", credential: "..." }
-       ]
-
-     Перевірити можна в застосунку:
-     Налаштування → Хмара → «Перевірити проєкт». */
-  ice: []
+  /* Ті самі дані можна брати посиланням — тоді логін і пароль
+     будуть тимчасовими й не лежатимуть у цьому файлі. У кабінеті
+     metered.ca: «Show API Key» біля вашої credential, посилання
+     виду https://<ваш>.metered.live/api/v1/turn/credentials?apiKey=…
+     Якщо заповнити, воно старше за ice вище. */
+  iceUrl: ""
 };

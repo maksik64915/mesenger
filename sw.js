@@ -4,7 +4,7 @@
    повідомляє сторінку про нову версію та показує сповіщення —
    зокрема пуші, які приходять, коли застосунок закрито.
    ============================================================ */
-const VERSION = 'homin-v1.8.0';
+const VERSION = 'homin-v1.9.0';
 const SHELL = VERSION + '-shell';
 const RUNTIME = VERSION + '-runtime';
 
@@ -12,7 +12,7 @@ const RUNTIME = VERSION + '-runtime';
 const CORE = [
   './',
   './index.html',
-  './firebase-config.js',
+  './firebase-config.js?v=19',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -74,7 +74,8 @@ self.addEventListener('message', event => {
    ============================================================ */
 function show(d) {
   const title = d.title || 'Гомін';
-  return self.registration.showNotification(title, {
+  const call = d.kind === 'call';
+  const opts = {
     body: d.body || 'Нове повідомлення',
     icon: 'icons/icon-192.png',
     badge: 'icons/favicon-64.png',
@@ -82,9 +83,18 @@ function show(d) {
     renotify: true,
     lang: 'uk',
     timestamp: Date.now(),
-    vibrate: [60, 40, 60],
-    data: { chatId: d.chatId || null, url: d.url || './' }
-  });
+    /* дзвінок має дзвонити довше й не зникати сам */
+    vibrate: call ? [300, 150, 300, 150, 300, 150, 300] : [60, 40, 60],
+    requireInteraction: call,
+    data: { chatId: d.chatId || null, url: d.url || './', kind: d.kind || 'msg' }
+  };
+  if (call) {
+    opts.actions = [
+      { action: 'accept', title: 'Відповісти' },
+      { action: 'decline', title: 'Відхилити' }
+    ];
+  }
+  return self.registration.showNotification(title, opts);
 }
 
 /* Пуш приходить у двох виглядах: від власного ретранслятора —
@@ -99,6 +109,7 @@ function normalize(d) {
     body: d.body || n.body || x.body,
     chatId: d.chatId || x.chatId || null,
     tag: d.tag || x.tag || n.tag,
+    kind: d.kind || x.kind || null,
     url: d.url || x.url
   };
 }
@@ -114,18 +125,27 @@ self.addEventListener('push', event => {
 
 self.addEventListener('notificationclick', event => {
   const data = (event.notification && event.notification.data) || {};
+  const action = event.action || '';
   event.notification.close();
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     const scope = new URL(self.registration.scope);
     for (const c of all) {
       if (new URL(c.url).origin !== scope.origin) continue;
-      try { await c.focus(); } catch (e) {}
-      c.postMessage({ type: 'OPEN_CHAT', chatId: data.chatId || null });
+      /* «Відхилити» не має витягати застосунок на екран */
+      if (action !== 'decline') { try { await c.focus(); } catch (e) {} }
+      c.postMessage({ type: 'OPEN_CHAT', chatId: data.chatId || null, action, kind: data.kind || 'msg' });
       return;
     }
-    /* застосунок закритий — відкриваємо його */
-    const url = data.chatId ? './?a=chat&c=' + encodeURIComponent(data.chatId) : './';
+    if (action === 'decline') return;
+    /* застосунок закритий — відкриваємо його; якщо той, хто дзвонив,
+       ще не поклав слухавку, дзвінок дійде туди сам */
+    let url = './';
+    if (data.chatId) {
+      url = './?a=' + (data.kind === 'call' ? 'call' : 'chat') +
+            '&c=' + encodeURIComponent(data.chatId) +
+            (action ? '&act=' + encodeURIComponent(action) : '');
+    }
     try { await self.clients.openWindow(url); } catch (e) {}
   })());
 });
