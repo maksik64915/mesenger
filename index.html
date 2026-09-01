@@ -1844,7 +1844,10 @@ const auth = {
     S.me={ id:'homin-'+o.username, username:o.username, name:o.name,
            email:o.email||'', bio:o.bio||'В мережі через Гомін', avatar:o.avatar||null };
     S.chats={}; S.calls=[];
-    if(cloud==='ok') S.me.uid=window.H.cloud.uid();
+    if(cloud==='ok'){
+      S.me.uid=window.H.cloud.uid();
+      if(o.remember!==false) await window.H.cloud.rememberLogin(o.username, o.password);
+    }
     else await window.H.e2e.create(o.password);
     await startSession(o.username, bits, o.remember!==false);
     await initDb();
@@ -1866,6 +1869,7 @@ const auth = {
            bio:profile.bio||'', avatar:profile.avatar||null, uid:profile.uid||null };
     S.chats={}; S.calls=[];
     await startSession(username, bits, remember!==false);
+    if(remember!==false) await window.H.cloud.rememberLogin(username, password);
     await initDb();
     if(window.H.e2e.ready()) await window.H.e2e.rewrap(password);
     await persist();
@@ -1892,7 +1896,11 @@ const auth = {
     if(window.H.cloud.configured()){
       const r=await window.H.cloud.linkAccount(username, password,
         {name:S.me.name, bio:S.me.bio, avatar:S.me.avatar});
-      if(r==='ok'){ S.me.uid=window.H.cloud.uid(); window.H.cloud.start(); }
+      if(r==='ok'){
+        S.me.uid=window.H.cloud.uid();
+        if(remember) await window.H.cloud.rememberLogin(username, password);
+        window.H.cloud.start();
+      }
     } else {
       await window.H.e2e.unlock(password, null);
     }
@@ -1915,10 +1923,13 @@ const auth = {
       applyData(data);
       await window.H.e2e.resume();
       if(window.H.cloud.configured()){
-        window.H.cloud.init().then(async ok=>{
+        const cl=window.H.cloud;
+        cl.init().then(async ok=>{
           if(!ok) return;
-          const fbUser=await window.H.cloud.waitAuth();
-          if(fbUser) window.H.cloud.start();
+          let live=await cl.waitAuth();
+          if(!live) live=await cl.resumeSession(u);
+          if(live){ S.me.uid=cl.uid(); cl.start(); persist(); }
+          else if(window.H.cloudNeedsLink) window.H.cloudNeedsLink();
         });
       }
       return true;
@@ -1926,6 +1937,8 @@ const auth = {
   },
 
   logout(){
+    const who=sess?sess.username:store.get(SESSION,null);
+    if(who) window.H.cloud.forgetLogin(who);
     window.H.e2e.lock();
     window.H.cloud.signOutCloud();
     window.H.db.close();
@@ -1947,7 +1960,10 @@ const auth = {
     /* уся база перешифровується новим ключем — інакше старі записи
        вже не відкриються */
     if(window.H.db.active() && !await window.H.db.rekey(newKey)) return 'failed';
-    if(window.H.cloud.on()) await window.H.cloud.changePassword(sess.username, newPass);
+    if(window.H.cloud.on()){
+      await window.H.cloud.changePassword(sess.username, newPass);
+      if(store.get(rememberKey(sess.username), null)) await window.H.cloud.rememberLogin(sess.username, newPass);
+    }
     else await window.H.e2e.rewrap(newPass);
     rec.salt=salt; rec.verifier=await verifierOf(bits);
     upsertAcc(rec);
@@ -1958,6 +1974,7 @@ const auth = {
   },
 
   removeAccount(username){
+    window.H.cloud.forgetLogin(username);
     window.H.db.dropAccount(username);
     saveAccounts(accounts().filter(a=>a.username!==username));
     store.del(dataKey(username));
@@ -2559,7 +2576,7 @@ SCREENS.settings = {
         <button class="srow" data-act="wipe"><span class="ic" style="background:#C0392B">${ic('trash')}</span>
           <div class="t"><b style="color:var(--danger)">Видалити акаунт із пристрою</b><small>Профіль, чати та журнал дзвінків</small></div></button>
       </div>
-      <div style="text-align:center;color:var(--faint);font-size:12px;padding:0 0 20px">Гомін · версія 1.7 · PWA</div>
+      <div style="text-align:center;color:var(--faint);font-size:12px;padding:0 0 20px">Гомін · версія 1.8 · PWA</div>
     </div>`;
   },
   mount(root){
@@ -2616,8 +2633,10 @@ function cloudRows(){
              net:'Немає звʼязку з Firebase',
              wrong:'Пароль не підійшов до хмарного акаунта',
              error:'Firebase відповів помилкою — перевірте, чи створено Firestore і чи опубліковано правила'};
+  const people=cl.people();
   const sub = live ? (cl.syncing()
         ? 'Увімкнено · @'+esc(S.me?S.me.username:'')+' · чатів у хмарі: '+cl.chats()
+          +(people!=null?' · людей у базі: '+people:'')
         : 'Вхід є, але синхронізація не почалася — найчастіше це правила Firestore')
     : st==='init' ? 'Підключаємось…'
     : (why[cl.authError()] || (st==='error' ? 'Помилка звʼязку — торкніться, щоб перевірити налаштування'
@@ -2716,8 +2735,22 @@ function diagHTML(d){
         d.vapid?'Ключ Web Push на місці — пуш увімкнеться сам':'Адреса ретранслятора на місці',
         'Пуш із закритим застосунком',
         'Немає ані vapidKey, ані relay у firebase-config.js — сповіщення приходитимуть лише поки Гомін відкритий')}
+    ${line(d.turn===true, 'TURN відповідає — дзвінки проходять крізь будь-який NAT',
+        'Дзвінки з різних мереж',
+        d.turn===false && window.H.hasTurn()
+          ? 'TURN вказано, але він не відповів — перевірте адресу й пароль'
+          : 'Немає TURN у firebase-config.js: повідомлення ходять через хмару завжди, а дзвінки — здебільшого лише в межах однієї мережі')}
   </div>`;
 }
+
+window.H.cloudNeedsLink=function(){
+  if(!window.H.cloud.configured() || window.H.cloud.on()) return;
+  setTimeout(()=>{
+    toast('Акаунт ще не в хмарі — без неї вас не знайдуть з іншої мережі', 9000,
+      {label:'Підключити', fn:()=>cloudLinkSheet()});
+  }, 1800);
+};
+window.H.cloudLink=()=>cloudLinkSheet();
 
 function cloudLinkSheet(){
   const cl=window.H.cloud;
@@ -4447,6 +4480,28 @@ const lookups={};
 let peer=null, peerLoaded=false, callObj=null, idRetry=0, myPeer=null;
 let tries=0, connectAt=0;
 
+/* Прямий звʼязок між двома телефонами в різних мережах майже
+   завжди впирається в NAT оператора. STUN лише підказує вашу
+   зовнішню адресу; провести трафік крізь «глухий» NAT може тільки
+   TURN. Свій вкажіть у firebase-config.js полем ice — без нього
+   дзвінки працюють здебільшого в межах однієї мережі, а
+   повідомлення все одно доходять через хмару. */
+const STUN=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302',
+                   'stun:stun.cloudflare.com:3478']}];
+function iceServers(){
+  const cfg=window.H.cloud.config()||{};
+  return (Array.isArray(cfg.ice) && cfg.ice.length) ? cfg.ice : STUN;
+}
+function hasTurn(){ 
+  return iceServers().some(s=>{
+    const u=s&&s.urls;
+    const list=Array.isArray(u)?u:[u];
+    return list.some(x=>String(x||'').indexOf('turn')===0);
+  });
+}
+window.H.iceServers=iceServers;
+window.H.hasTurn=hasTurn;
+
 /* homin-maks-3f8a1c  ->  homin-maks */
 function canon(pid){
   const p=String(pid||'').split('-');
@@ -4502,7 +4557,7 @@ const net = {
       if(peer){ try{peer.destroy();}catch(e){} }
       S.me.id = idOf(S.me.username);
       myPeer = myPeerId();
-      peer = new window.Peer(myPeer, {debug:0});
+      peer = new window.Peer(myPeer, {debug:0, config:{iceServers:iceServers()}});
     }catch(e){ setNet('bad'); return; }
     /* Буває, що сервер не відповідає ні «готово», ні помилкою.
        Без цього сторожа застосунок підключався б нескінченно. */
@@ -5552,6 +5607,7 @@ const {S, save, toast, store, uid, idOf, userOf, normUser} = window.H;
 const SDK='https://www.gstatic.com/firebasejs/12.18.0/';
 const CFG='homin.fb';
 const DEV='homin.device';
+const KEEP='homin.fbk.';   // памʼять про вхід у Firebase (лише якщо просили запамʼятати)
 const MEDIA_MAX=700000;      // більше в документ Firestore не влізе
 const KEEP_DEVICE=3*86400000; // скільки памʼятати чужий пристрій у списку
 
@@ -5566,6 +5622,7 @@ const profiles=new Map();           // uid -> профіль
 const link=new Map();               // локальний chatId -> {cloudId, uid}
 let deviceId=null;
 let lastError='', fcmToken=null, authError='';
+let peopleCount=null;
 let authReady=null, authSeen=null;
 
 /* ---------- налаштування ---------- */
@@ -5747,6 +5804,25 @@ async function changePassword(username, newPass){
   catch(e){ return mapAuthError(e); }
 }
 
+/* Автоматичний вхід у застосунок має так само тихо заходити і в
+   хмару — інакше пристрій лишається без синхронізації, а людину
+   поза вашою мережею неможливо ані знайти, ані дописатися. */
+async function rememberLogin(username, password){
+  try{ store.set(KEEP+username, await secret(username, password)); }catch(e){}
+}
+function forgetLogin(username){ store.del(KEEP+username); }
+async function resumeSession(username){
+  if(!await init()) return false;
+  if(user) return true;
+  const kept=store.get(KEEP+username, null);
+  if(!kept) return false;
+  try{
+    const cred=await A.signInWithEmailAndPassword(auth, emailOf(username), kept);
+    user=cred.user; authError='';
+    return true;
+  }catch(e){ authError=mapAuthError(e); return false; }
+}
+
 async function signOutCloud(){
   stop();
   try{ if(auth) await A.signOut(auth); }catch(e){}
@@ -5804,6 +5880,18 @@ async function lookup(username){
   if(!s.exists()) return null;
   const p=await profileOf(s.data().uid);
   return p || undefined;
+}
+
+/* База користувачів: скільки людей уже зареєструвалося.
+   Заразом це перевірка, що читання профілів справді працює. */
+async function countPeople(){
+  if(!user || !fs) return null;
+  try{
+    const snap=await within(F.getDocs(F.query(F.collection(fs,'users'), F.limit(200))), 8000, null);
+    if(!snap) return null;
+    peopleCount=snap.size;
+    return peopleCount;
+  }catch(e){ return null; }
 }
 
 /* ---------- пристрої та присутність ---------- */
@@ -6058,7 +6146,31 @@ async function diagnose(){
            : c.indexOf('timeout')>=0 ? 'none'
            : c.indexOf('unavailable')>=0 ? 'net' : 'error';
   }
+
+  out.turn = await turnWorks();
   return out;
+}
+
+/* Чи справді проходить TURN: збираємо кандидати й дивимось, чи
+   зʼявився relay. Це найчесніша перевірка «чи буде дзвінок між
+   різними мережами». */
+function turnWorks(){
+  if(!window.H.hasTurn()) return Promise.resolve(null);
+  return new Promise(res=>{
+    let pc, done=false;
+    const fin=v=>{ if(done) return; done=true; try{ pc.close(); }catch(e){} res(v); };
+    try{ pc=new RTCPeerConnection({iceServers:window.H.iceServers()}); }
+    catch(e){ return res(false); }
+    pc.onicecandidate=e=>{
+      if(!e.candidate) return fin(false);
+      if((e.candidate.candidate||'').indexOf(' typ relay')>=0) fin(true);
+    };
+    try{
+      pc.createDataChannel('probe');
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>fin(false));
+    }catch(e){ return fin(false); }
+    setTimeout(()=>fin(false), 8000);
+  });
 }
 
 /* ---------- підписки ---------- */
@@ -6066,6 +6178,7 @@ function start(){
   if(!user || started || !fs) return;
   started=true; state='on';
   profileOf(user.uid).then(()=>touch(window.H.net.peerId()));
+  countPeople();
   try{
     unsubMe=F.onSnapshot(F.doc(fs,'users',user.uid), s=>{
       if(!s.exists()) return;
@@ -6104,10 +6217,12 @@ window.H.cloud = {
   setConfig(o){ store.set(CFG, o||null); cfg=readCfg(); },
   clearConfig(){ store.del(CFG); cfg=null; },
   init, signUp, signIn, signOutCloud, linkAccount, changePassword, usernameFree, diagnose,
+  rememberLogin, forgetLogin, resumeSession,
   waitAuth(){ return authReady || Promise.resolve(null); },
   start, stop, lookup, profileOf, setProfile, peersOf, touch,
   ensureCloudChat, send, markRead, friendRequest, acceptFriend, declineFriend,
   publishPushCard, enableFCM, fcm:()=>!!fcmToken,
+  countPeople, people:()=>peopleCount,
   chats:()=>link.size
 };
 })();
