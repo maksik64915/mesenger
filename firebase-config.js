@@ -44,7 +44,7 @@ window.HOMIN_FIREBASE = {
 
      Або власний сервер із теки push-relay. Якщо ви розгорнули
      Cloud Functions у Firebase, це поле можна лишити порожнім. */
-  relay: "",
+  relay: "https://dgejptbuknxzqkrloqao.supabase.co/functions/v1/push",
 
   /* Сервери для встановлення прямого звʼязку.
 

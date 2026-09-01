@@ -23,19 +23,26 @@ Supabase тут відповідає лише за сповіщення.
 немає: воно йде або напряму між пристроями, або зашифрованим
 через Firestore.
 
-## Налаштування (5 хвилин)
+## Найпростіше: один скрипт
 
 1. Створіть проєкт на [supabase.com](https://supabase.com) —
    картка не потрібна.
-2. Створіть ключі VAPID:
+2. Запустіть:
+
+```bash
+cd supabase && bash setup.sh
+```
+
+Скрипт створить ключі VAPID, покладе їх у секрети проєкту,
+опублікує функцію, перевірить її й надрукує рядок, який
+лишиться вставити в `firebase-config.js`. Спитає він лише
+пошту та ref проєкту (це те, що в адресі кабінету:
+`supabase.com/dashboard/project/<ref>`).
+
+## Або вручну
 
 ```bash
 npx web-push generate-vapid-keys
-```
-
-3. Розгорніть функцію:
-
-```bash
 npx supabase login
 npx supabase link --project-ref <ваш-ref>
 npx supabase secrets set VAPID_PUBLIC=<публічний> VAPID_PRIVATE=<приватний> VAPID_SUBJECT=mailto:you@example.com
@@ -56,6 +63,19 @@ relay: "https://<ваш-ref>.supabase.co/functions/v1/push"
 ключ, підпишеться на push-службу браузера й передасть свою адресу
 підписки друзям. Коли друг напише вам, а Гомін буде закритий, його
 застосунок постукає у вашу функцію — і телефон задзвонить.
+
+## Якщо CLI лається на «Entrypoint path does not exist»
+
+Значить, його запустили не з кореня проєкту: Supabase CLI шукає
+функції за шляхом `supabase/functions/<назва>` від поточної теки.
+`setup.sh` це вже враховує. Вручну — з кореня `homin/`:
+
+```bash
+npx supabase functions deploy push --no-verify-jwt
+```
+
+Попередження «Docker is not running» можна ігнорувати: докер
+потрібен лише для локального запуску функції, а не для публікації.
 
 ## Перевірка
 

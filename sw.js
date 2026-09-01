@@ -12,7 +12,7 @@ const RUNTIME = VERSION + '-runtime';
 const CORE = [
   './',
   './index.html',
-  './firebase-config.js?v=19',
+  './firebase-config.js?v=20',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

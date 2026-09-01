@@ -816,7 +816,7 @@ textarea.inp{resize:none;min-height:78px;line-height:1.45;}
 <!-- Дані проєкту (порожні = хмара вимкнена). Номер у кінці —
      щоб браузер не показував старий кеш після зміни файла:
      міняючи firebase-config.js, підніміть і його. -->
-<script src="firebase-config.js?v=19"></script>
+<script src="firebase-config.js?v=20"></script>
 <script>
 /* ============================================================
    ГОМІН — ядро: утиліти, сховище, стан, навігація
@@ -4650,7 +4650,11 @@ const net = {
       if(t==='peer-unavailable'){
         const m=(err.message||'').match(/homin-[a-z0-9_]+/);
         if(m && lookups[m[0]]) lookups[m[0]].fail();
-        if(m && callUI && callUI.peerId===m[0] && !callUI.connected) endCall('Абонент не в мережі', true);
+        /* Раніше тут дзвінок обривався: «Абонент не в мережі».
+           Але саме в цю мить його телефон будить пуш — треба
+           просто дочекатися. Тримаємо виклик і повторюємо
+           спробу, як роблять звичайні месенджери. */
+        if(m && callUI && callUI.peerId===m[0] && !callUI.connected) waitForPeer();
         return; }
       if(t==='unavailable-id'){
         /* імʼя вже зайняте іншим нашим пристроєм — беремо власне */
@@ -4853,6 +4857,12 @@ function attach(conn){
   conn.on('open', ()=>{
     const c=ensureChat(id);
     c.online=true; save();
+    /* співрозмовник щойно зʼявився, а ми йому дзвонимо — пробуємо
+       негайно, не чекаючи наступної спроби */
+    if(callUI && !callUI.connected && !callUI.incoming && callUI.peerId===id){
+      stopWaiting();
+      setTimeout(()=>dialTo(id), 400);
+    }
     try{ conn.send({t:'hello', profile:myProfile(), push:myPush(c)}); }catch(e){}
     flush(id);
     net.sendRead(id);
@@ -5008,6 +5018,7 @@ function bindStreams(){
 }
 function closeCallUI(instant){
   ringStop();
+  stopWaiting();
   hideRingBar(instant);
   clearInterval(callTimer);
   if(callUI && callUI.el){
@@ -5043,11 +5054,38 @@ async function startCall(id, kind){
   const conn=conns[id];
   if(conn && conn.open){ try{ conn.send({t:'ring', kind}); }catch(e){} }
   else window.H.notify.wake(chat, 'call');   /* друг офлайн — хай телефон задзвонить */
-  try{ callObj = peer.call(targetOf(id), localStream, {metadata:{kind, profile:shortProfile()}}); }
-  catch(e){ endCall('Не вдалося зателефонувати', true); return; }
-  wireCall(callObj);
+  dialTo(id);
   setTimeout(()=>{ if(callUI && !callUI.connected) endCall('Немає відповіді', true); }, 45000);
 }
+
+/* Один «гудок»: спроба додзвонитися на пристрій співрозмовника. */
+function dialTo(id){
+  if(!callUI || callUI.connected || !localStream) return;
+  try{ callObj && callObj.close(); }catch(e){}
+  try{ callObj = peer.call(targetOf(id), localStream, {metadata:{kind:callUI.kind, profile:shortProfile()}}); }
+  catch(e){ endCall('Не вдалося зателефонувати', true); return; }
+  wireCall(callObj);
+}
+
+/* Телефон співрозмовника ще спить. Пуш уже пішов; тепер просто
+   передзвонюємо кожні три секунди, доки він не прокинеться або
+   доки не мине хвилина виклику. */
+let waitTimer=null;
+function waitForPeer(){
+  if(!callUI || callUI.connected || callUI.incoming) return;
+  const id=callUI.peerId, chat=S.chats[id];
+  callUI.waiting=true;
+  callUI.label='Дзвонимо… чекаємо, поки візьме слухавку';
+  repaintCall();
+  net.addPeer(id, true);
+  window.H.notify.wake(chat, 'call');
+  clearTimeout(waitTimer);
+  waitTimer=setTimeout(()=>{
+    if(!callUI || callUI.connected) return;
+    dialTo(id);
+  }, 3000);
+}
+function stopWaiting(){ clearTimeout(waitTimer); waitTimer=null; }
 function wireCall(call){
   call.on('stream', rs=>{
     remoteStream=rs; ringStop();
